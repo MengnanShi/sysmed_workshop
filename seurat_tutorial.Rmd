@@ -1,0 +1,443 @@
+---
+title: "seurat_tutorial"
+output: html_document
+date: "2023-10-16"
+author: "Mengnan Shi"
+reference: https://nbisweden.github.io/workshop-scRNAseq/exercises.html 
+---
+
+```{r}
+suppressMessages({
+  # seurat: 4.2.1
+  library(Seurat)
+  library(tidyverse)
+  library(SingleCellExperiment)
+  library(ggplot2)
+  library(cowplot)
+  library(clusterProfiler)
+  library(magrittr)
+})
+
+path="/Users/mengnan.shi/Documents/KTH/teaching/zhuwentao_singlecell/data/GSE152042_RAW"
+input_path = file.path(path,"data")
+output_path = file.path(path,"results")
+plt_path = file.path(output_path,"figures")
+
+```
+
+# 1. data loading
+
+## 1.1 check the input dataset
+
+```{r}
+# check the datasets
+files = list.files(input_path)
+print(files)
+
+```
+
+## 1.2 build seurat object
+
+```{r}
+
+# read all data
+adata_h1 = Read10X_h5(file.path(input_path,files[1]))
+adata_h1 = CreateSeuratObject(counts = adata_h1, project="h1")
+adata_h1$type = "ctl"
+  
+adata_h2 = Read10X_h5(file.path(input_path,files[2]))
+adata_h2 = CreateSeuratObject(counts = adata_h2, project="h2")
+adata_h2$type = "ctl"
+
+adata_p1 = Read10X_h5(file.path(input_path,files[3]))
+adata_p1 = CreateSeuratObject(counts = adata_p1, project="p1")
+adata_p1$type = "pt"
+
+adata_p2 = Read10X_h5(file.path(input_path,files[4]))
+adata_p2 = CreateSeuratObject(counts = adata_p2, project="p2")
+adata_p2$type = "pt"
+
+adata = merge(x = adata_h1, y=c(adata_h2, adata_p1, adata_p2), add.cell.id = c("h1","h2","p1","p2"), project = "Gingiva")
+
+rm(adata_h1,adata_h2,adata_p1,adata_p2)
+# run garbage collect to free up memory
+gc()
+adata
+```
+
+## 1.3 seurat object: S4 object
+
+```{r}
+print(dim(adata))
+print(colnames(adata)[1:5])
+print(rownames(adata)[1:5])
+print(as.data.frame(adata@assays$RNA@counts[1:10, 1:2]))
+print(head(adata@meta.data, 10))
+```
+
+# 2. pre-processing
+
+## 2.1 calculate the percentage of mitochondrial genes and ribosomal genes
+
+```{r}
+# percentage of mitochondrial genes
+adata[["percent_mt"]] = PercentageFeatureSet(adata, pattern = "^MT-")
+# percentage of ribosomal genes
+adata[["percent_rb"]] = PercentageFeatureSet(adata, pattern = "^RP[SL]")
+
+# check data quality by violin plot
+VlnPlot(adata,group.by="orig.ident", features = c("nFeature_RNA", "nCount_RNA", "percent_mt","percent_rb"), ncol = 4, pt.size=0.1)
+
+```
+
+```{r}
+# check the most expressed genes
+C <- adata@assays$RNA@counts
+C <- Matrix::t(Matrix::t(C)/Matrix::colSums(C)) * 100
+most_expressed <- order(apply(C, 1, median), decreasing = T)[20:1]
+boxplot(as.matrix(t(C[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+rm(C)
+```
+
+## 2.2 correlation between features
+
+```{r}
+FeatureScatter(adata, "nCount_RNA", "nFeature_RNA", group.by = "orig.ident", pt.size = 0.1)
+```
+
+## 2.3 data filtering
+
+```{r}
+select_f = rownames(adata)[Matrix::rowSums(adata) > 3]
+adata = subset(adata, subset = nFeature_RNA >200 & percent_mt < 25 & percent_rb > 5, features =select_f )
+dim(adata)
+```
+
+```{r}
+VlnPlot(adata,group.by="orig.ident", features = c("nFeature_RNA", "nCount_RNA", "percent_mt","percent_rb"), ncol = 4, pt.size=0.01)
+```
+
+```{r}
+# optional
+adata <- adata[!grepl("MALAT1", rownames(adata)), ]
+```
+
+# 3. data normalization
+
+```{r}
+adata <- NormalizeData(adata, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+# 4. find high variable genes (hvg)
+
+```{r}
+adata <- FindVariableFeatures(adata, selection.method = "vst", nfeatures = 2000)
+
+# plot the top 10 hvg
+top10 <- head(VariableFeatures(adata), 10)
+LabelPoints(plot = VariableFeaturePlot(adata), points = top10, repel = TRUE)
+
+```
+
+# 5. dimentional reduction
+
+## 5.1 data scaling and PCA
+
+```{r}
+all.genes <- rownames(adata)
+adata <- ScaleData(adata, features = all.genes)
+adata <- RunPCA(adata, features = VariableFeatures(object = adata), npcs = 50, verbose=F)
+```
+
+## 5.2 tSNE
+
+```{r}
+adata <- RunTSNE(adata, reduction = "pca", dims = 1:30)
+```
+
+## 5.3 UMAP
+
+```{r}
+adata <- RunUMAP(adata, reduction = "pca", dims = 1:30, n.components = 2, n.neighbors = 30, verbose=F)
+```
+
+## 5.4 ploting
+
+```{r}
+plot_grid(ncol=3,
+          DimPlot(adata, reduction = "pca",group.by = "orig.ident")+ggplot2::ggtitle(label="PCA plot"),
+          DimPlot(adata, reduction = "tsne",group.by = "orig.ident")+ggplot2::ggtitle(label="tSNE plot"),
+          DimPlot(adata, reduction = "umap",group.by = "orig.ident")+ggplot2::ggtitle(label="UMAP plot"))
+
+```
+
+# 6. clustering
+
+## 6.1 calculate nearest neighbors
+
+```{r}
+adata <- FindNeighbors(adata, dims = 1:30, k.param = 30, graph.name = "k_30")
+adata <- FindNeighbors(adata, dims = 1:30, k.param = 60, graph.name = "k_60")
+print(names(adata@graphs))
+
+```
+
+## 6.2 identify clusters based on graph
+
+```{r}
+for (res in c(0.1, 0.25, 0.5, 1, 1.5, 2)) {
+    adata <- FindClusters(adata, graph.name = "k_30", resolution = res, algorithm = 1)
+}
+
+plot_grid(ncol = 3, 
+          DimPlot(adata, reduction = "umap", group.by = "k_30_res.0.5") + ggtitle("louvain_0.5"), 
+          DimPlot(adata, reduction = "umap", group.by = "k_30_res.1") + ggtitle("louvain_1"), 
+          DimPlot(adata, reduction = "umap", group.by = "k_30_res.2") + ggtitle("louvain_2"))
+```
+
+## 6.3 identify cluster makers
+
+```{r}
+# determine the clusters
+sel.clust = "k_60_res.0.5"
+Idents(adata) = sel.clust
+
+# find marker genes for all clusters
+markers_genes <- FindAllMarkers(adata, 
+                                log2FC.threshold = 0.2, 
+                                test.use = "wilcox",
+                                min.pct = 0.1, 
+                                min.diff.pct = 0.2, 
+                                only.pos = TRUE, 
+                                max.cells.per.ident = 50,
+                                assay = "RNA")
+
+top5 = markers_genes %>%
+  group_by(cluster) %>%
+  top_n(-5, p_val_adj) 
+
+# create a scale.data slot for the selected genes
+adata <- ScaleData(adata, features = as.character(unique(top5$gene)), assay = "RNA")
+# heatmap for top 5 marker genes
+DoHeatmap(adata, features = as.character(unique(top5$gene)), group.by = sel.clust, assay = "RNA")
+```
+
+# 7. cell type prediction
+
+## 7.1 read panglaoDB
+
+```{r}
+# read reference data
+reference = read.csv(file.path("/Users/mengnan.shi/Documents/KTH/teaching/zhuwentao_singlecell/data","PanglaoDB_markers_27_Mar_2020.tsv"), sep="\t")
+
+reference %>% head
+gene_term = reference %>% 
+  filter(species %in% c("Mm Hs", "Hs")) %>% 
+  select(term = cell.type, gene = official.gene.symbol)
+```
+
+## 7.2 extract differential expressed gene info
+
+```{r}
+DEG_list <- split(markers_genes, markers_genes$cluster)
+DEG_list = lapply(DEG_list, function(currlist){
+  return(currlist %>% filter(p_val_adj <0.05))
+})
+unlist(lapply(DEG_list, nrow))
+
+```
+
+## 7.3 way1: GSEA
+
+```{r}
+# process GSEA
+pred = lapply(DEG_list, function(currlist){
+  gene_order = setNames(currlist$avg_log2FC, currlist$gene)
+  gene_order = sort(gene_order,decreasing = T)
+  res = GSEA(gene_order, TERM2GENE = gene_term,pvalueCutoff = 0.05, maxGSSize = 10000, nPermSimple = 10000, pAdjustMethod = "bonferroni")
+  return(res%>% filter(enrichmentScore>0))
+})
+
+pred_res = unlist(lapply(pred, function(currlist){
+  if(nrow(currlist@result)!=0){
+      return(currlist@result[1,1])
+  }else{
+    return(NA)
+  }
+}))
+
+```
+
+```{r}
+# rename the cluster with predicted cell type
+adata$ref_panglaodb_gsea = pred_res[as.character(adata@active.ident)]
+
+plot_grid(ncol = 2, DimPlot(adata, label = T, group.by = "k_60_res.0.5"), 
+          DimPlot(adata, label = T, group.by = "ref_panglaodb_gsea") )
+```
+
+## 7.4 way 2: GSOA
+
+```{r}
+topx = 20
+pred = lapply(DEG_list, function(currlist){
+  genes = rownames(currlist)[1:topx]
+  res = enricher(genes, TERM2GENE = gene_term,pvalueCutoff = 0.05, minGSSize = 1,maxGSSize = 10000,pAdjustMethod = "BH",universe=rownames(currlist))
+  return(res)
+})
+
+pred_res = unlist(lapply(pred, function(currlist){
+  if(!is.null(currlist)){
+      return(currlist@result[1,1])
+  }else{
+    return(NA)
+  }
+}))
+
+# rename the cluster with predicted cell type
+adata$ref_panglaodb_gsoa = pred_res[as.character(adata@active.ident)]
+
+plot_grid(ncol = 2, 
+          DimPlot(adata, label = T, group.by = "k_60_res.0.5"), 
+          DimPlot(adata, label = T, group.by = "orig.ident"),
+          DimPlot(adata, label = T, group.by = "ref_panglaodb_gsea"),
+          DimPlot(adata, label = T, group.by = "ref_panglaodb_gsoa"))
+
+
+```
+
+# 8. differential expressed analysis across conditions
+
+```{r}
+# select all cells in cluster 5
+cell_selection <- subset(adata, cells = colnames(adata)[adata@meta.data[, sel.clust] == 5])
+# set condition as active ident
+cell_selection <- SetIdent(cell_selection, value = "type")
+# Compute differential expression
+DGE_cell_selection <- FindAllMarkers(cell_selection, log2FC.threshold = 0.2, test.use = "wilcox",
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = 50,
+    assay = "RNA")
+top5_cell_selection = DGE_cell_selection %>%
+  group_by(cluster) %>%
+  top_n(-5, p_val)
+
+VlnPlot(cell_selection, features = as.character(unique(top5_cell_selection$gene)),
+    ncol = 5, group.by = "type", assay = "RNA", pt.size = 0.1)
+```
+
+# 9. cell type population
+
+```{r}
+# calculate cell type percentage 
+cells = adata@meta.data %>% group_by(type) %>% summarise(n=n()) %$% set_names(n, nm=type)
+cell_num = adata@meta.data %>% 
+  group_by(ref_panglaodb_gsoa, type) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  mutate(pct = case_when(type=="ctl" ~ round(n/cells["ctl"]*100,2),
+                         type =="pt" ~ round(n/cells["pt"]*100,2)))
+
+
+# bar plot
+cell_num %>% 
+  ggplot()+
+  geom_bar(aes(x = ref_panglaodb_gsoa, y = pct,fill=type), stat="identity")+
+  theme(panel.border = element_rect(color="#78A493", fill=NA,linewidth = 2), 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        panel.background = element_blank(), 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust=0),
+        axis.line = element_blank(), 
+        axis.ticks = element_blank())
+```
+
+# 10. trajectory analysis: ooptional
+
+```{r}
+library(slingshot)
+library(RColorBrewer)
+
+sce = as.SingleCellExperiment(adata)
+sce <- slingshot(sce, reducedDim = 'UMAP', clusterLabels =  'k_60_res.0.5', approx_points=50)
+line <- getLineages(sce, 
+                    clusterLabels = "k_60_res.0.5", 
+                    reducedDim = "UMAP")
+
+plot(reducedDims(sce)$UMAP,col = brewer.pal(10,'Paired')[sce$k_60_res.0.5],pch=16,asp=1)
+lines(SlingshotDataSet(line), lwd=2,col = 'black',type = 'lineages')
+legend("bottomright", pch = 16, col = 3:8, bty = "n", legend = levels(factor(colData(sce)$k_60_res.0.5)))
+```
+
+# 11. another way to perform analysis
+
+```{r}
+# after data filtering
+
+# replace NormalizeData(), ScaleData(), and FindVariableFeatures()
+adata <- SCTransform(adata, verbose = FALSE)
+adata <- RunPCA(adata, verbose = FALSE)
+adata <- RunUMAP(adata, dims = 1:30, verbose = FALSE)
+adata <- FindNeighbors(adata, dims = 1:30, verbose = FALSE)
+adata <- FindClusters(adata, verbose = FALSE)
+DimPlot(adata, label = TRUE) + NoLegend()
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
